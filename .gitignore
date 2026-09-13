@@ -1,0 +1,9 @@
+.vs*
+.zed
+*.dll
+*.exp
+*.lib
+*.exe
+*.pdb
+*.rdbg
+
