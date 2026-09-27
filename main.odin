@@ -4,8 +4,10 @@ import "odinlib:util"
 import "core:time"
 import "core:unicode"
 import "core:log"
+import "core:fmt"
 import "core:math"
 import "core:slice"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:text/edit"
@@ -38,6 +40,7 @@ Colorscheme_Element :: enum {
     Plain_Text,
     Selected_Text,
     Selection_Box,
+    Current_Line,
     Caret,
     Builtin_Word,
     Comment,
@@ -57,6 +60,7 @@ COLORSCHEMES := []Colorscheme {
             .Selected_Text=COLOR_GREEN,
             .Selection_Box=COLOR_MAGENTA,
             .Caret=COLOR_MAGENTA,
+            .Current_Line=Color4f{0.9, 0.9, 0.9, 1.0},
             .Builtin_Word=Color4f{0.6, 0.0, 0.05, 1.0},
             .Comment=COLOR_GREY,
         }
@@ -68,6 +72,7 @@ COLORSCHEMES := []Colorscheme {
             .Plain_Text=COLOR_WHITE,
             .Selected_Text=COLOR_GREEN,
             .Selection_Box=COLOR_MAGENTA,
+            .Current_Line=Color4f{0.2, 0.2, 0.2, 1.0},
             .Caret=COLOR_MAGENTA,
             .Builtin_Word=Color4f{0.9, 0.0, 0.05, 1.0},
             .Comment=Color4f{0.7, 0.7, 0.7, 1.0},
@@ -76,7 +81,6 @@ COLORSCHEMES := []Colorscheme {
 }
 
 App_Init :: struct {
-    platform_command_proc: proc(_: util.Platform_Command),
     pixel_format: util.Pixel_Format,
 }
 
@@ -101,14 +105,23 @@ App_Context :: struct {
     font_path_index: int,
     font_pixmap: util.Pixmap,
     char_dims: vec2f,
-    baked_chars: [96]stbtt.bakedchar,
+    packed_chars: [96]stbtt.bakedchar,
+    // packed_chars: [96]stbtt.packedchar,
     render_group: Render_Group,
     edit_state: edit.State,
     edit_builder: strings.Builder,
     input_rune: Maybe(rune),
+    start_pos: vec2f,
+    caret_rect: Rect,
+    font_pack_context: stbtt.pack_context,
     font_scale: f32,
     font_pixel_height: i32,
-    font_ascent, font_descent, font_line_gap: i32
+    font_ascent, font_descent, font_line_gap: i32,
+    font_yadvance: f32,
+    mouse_cursor: util.Mouse_Cursor_Type,
+    exit_on_key_press: bool,
+    vm: VM,
+    history: [dynamic; 1*mem.Megabyte]u8,
 }
 
 app: ^App_Context
@@ -118,7 +131,7 @@ app_init :: proc(init_info: App_Init) -> bool {
     app.init_info = init_info
     app.running = true
     app.edit_builder = strings.builder_make()
-    // strings.write_string(&app.edit_builder, default_text)
+    strings.write_string(&app.edit_builder, default_text)
     edit.init(&app.edit_state, context.allocator, context.allocator)
     edit.setup_once(&app.edit_state, &app.edit_builder)
     app.edit_state.get_clipboard = proc(_: rawptr) -> (string, bool) {
@@ -127,23 +140,174 @@ app_init :: proc(init_info: App_Init) -> bool {
     app.edit_state.set_clipboard = proc(_: rawptr, text: string) -> bool {
         return set_clipboard_text(text)
     }
+    do_platform_command({type=.Change_Window_Icon, path="forth.ico"})
     log.debug("Char dims:", app.char_dims)
+    app.font_pixel_height = 32
     change_font()
     rg_init()
-    s := Scanner{str=": ( n -- n ) double 1 2 +   ;  "}
-    for str in scanner_next_word(&s) {
-        log.debugf("Len: %v; %s", len(str), str)
+    vm_init(&app.vm)
+    app.vm.output_str = proc(text: string) {
+        fmt.printfln(text)
+    }
+    // assemble(&app.vm,
+    //     "br 3 sq: dup mul ret lit 4 call sq dot lit 12 call sq dot")
+    // compile(&app.vm, ": sq dup * ; 4 sq . 12 sq .")
+    compile(&app.vm, ": sq dup * ; begin 4 sq . again")
+    // write_byte(&app.vm, cast(u8)VM_Opcode.LITERAL)
+    // write_cell(&app.vm, 100)
+    // write_byte(&app.vm, cast(u8)VM_Opcode.LITERAL)
+    // write_cell(&app.vm, 20)
+    // write_byte(&app.vm, cast(u8)VM_Opcode.MUL)
+    // write_byte(&app.vm, cast(u8)VM_Opcode.DOT)
+    // write_byte(&app.vm, cast(u8)VM_Opcode.BRANCH)
+    // write_i16(&app.vm, -23)
+    if err := vm_run(&app.vm); err != .Done {
+        log.errorf("VM_Error: %v", err)
+    }
+    fmt.println("DONE")
+    for {}
+
+    if len(os.args) > 1 {
+        source_text, err := os.read_entire_file_from_path(os.args[1], context.allocator)
+        if err == nil {
+            source_text := cast(string)source_text
+            strings.builder_reset(&app.edit_builder)
+            strings.write_string(&app.edit_builder, source_text)
+            interpret(&app.vm, source_text)
+            app.exit_on_key_press = true
+        }
     }
     return true
 }
+
+Textbox_Iterator :: struct {
+    text: string,
+    index: int,
+    start_pos, pen_pos: vec2f,
+    content_dims: vec2f,
+    reached_carriage_return: bool,
+    line: int,
+    skip_newline: bool,
+}
+
+Textbox_Char :: struct {
+    pos, dims, draw_pos: vec2f,
+    src_rect: Rect,
+    index: int,
+    line: int,
+    codepoint: rune,
+    printable: bool,
+}
+
+textbox_iterator_init :: proc(
+    tbi: ^Textbox_Iterator,
+    text: string,
+    start_pos: vec2f,
+    content_dims: vec2) 
+{
+    tbi.text = text
+    tbi.index = 0
+    tbi.start_pos = start_pos
+    tbi.pen_pos = start_pos
+    tbi.content_dims = cast(vec2f)content_dims
+    tbi.reached_carriage_return = false
+}
+
+textbox_iterator_next_char :: proc(tbi: ^Textbox_Iterator) -> (Textbox_Char, bool) {
+    next_line :: #force_inline proc(tbi: ^Textbox_Iterator) {
+        tbi.pen_pos.x = tbi.start_pos.x
+        tbi.pen_pos.y += app.font_yadvance
+    }
+    if tbi.index >= len(tbi.text) {
+        return {}, false
+    }
+    ch := cast(rune)tbi.text[tbi.index]
+    tbc := Textbox_Char {
+        codepoint=ch,
+        pos=tbi.pen_pos,
+        index=tbi.index,
+    }
+    tbi.index += 1
+    if ch == 0 {
+       return {}, false 
+    } else if ch == '\r' {
+        next_line(tbi)
+        tbi.reached_carriage_return = true
+        return tbc, true
+    } else if ch == '\n' {
+        if !tbi.reached_carriage_return {
+            next_line(tbi)
+        }
+        return tbc, true
+    }
+    // tbi.reached_carriage_return = false
+    pc_index := ch - 32
+    if pc_index < 0 || pc_index >= len(app.packed_chars) {
+        // FIXME:
+        assert(false)
+    }
+    tbc.printable = true
+    pc := app.packed_chars[pc_index]
+    advance_width, left_side_bearing: i32
+    stbtt.GetCodepointHMetrics(&app.font_info, ch, &advance_width, &left_side_bearing)
+    if (tbi.pen_pos.x + cast(f32)pc.xadvance) > tbi.content_dims.x {
+        next_line(tbi)
+    }
+    y := (cast(f32)app.font_ascent + pc.yoff)
+    tbc.src_rect = Rect{
+        x=cast(i32)pc.x0,
+        y=cast(i32)pc.y0,
+        w=cast(i32)(pc.x1 - pc.x0),
+        h=cast(i32)(pc.y1 - pc.y0),
+    }
+    tbc.draw_pos = tbi.pen_pos + {(cast(f32)left_side_bearing*app.font_scale), y}
+    tbc.dims = {pc.xadvance, app.font_yadvance}
+    tbi.pen_pos.x += pc.xadvance
+    return tbc, true
+} 
 
 colorscheme_elem_color :: #force_inline proc "contextless" (element_type: Colorscheme_Element) -> Color4f {
     return COLORSCHEMES[app.colorscheme_index].elements[element_type]
 }
 
-app_update_render :: proc(update_info: App_Update) -> bool {
+app_update :: proc(update_info: App_Update) -> bool {
     app.update_info = update_info
     edit.update_time(&app.edit_state)
+    tbi: Textbox_Iterator
+    text := strings.to_string(app.edit_builder)
+    textbox_iterator_init(
+        &tbi,
+        text,
+        app.start_pos,
+        {app.update_info.framebuffer.w, app.update_info.framebuffer.h}
+    )
+    hovered_char_index := -1
+    for tbc in textbox_iterator_next_char(&tbi) {
+        if hovered_char_index == -1 {
+            mouse_in_char := util.point_in_rect(
+               app.input_state.mouse_position,
+               Rect{
+                   cast(i32)tbc.pos.x,
+                   cast(i32)tbc.pos.y,
+                   cast(i32)tbc.dims.x,
+                   cast(i32)tbc.dims.y
+               }
+            )
+            if mouse_in_char {
+                hovered_char_index = tbc.index
+            }
+        }
+    }
+    if hovered_char_index != -1 && .Left in app.input_state.mouse_buttons {
+        app.edit_state.selection = {hovered_char_index, hovered_char_index}
+        reset_cursor_blink_state(true)
+    }
+    app.frame_index += 1
+    app.input_state.transient = {}
+    return app.running
+}
+
+app_render :: proc() {
     rg_clear(colorscheme_elem_color(.Background))
     pen_pos: util.vec2f
     rg_texture(app.font_pixmap)
@@ -151,71 +315,48 @@ app_update_render :: proc(update_info: App_Update) -> bool {
     if len(strings.to_string(app.edit_builder)) == 0 {
         rg_blit({0, 0})
     }
-    if key_mod_pair_is_pressed(.Control, util.KEY_C) {
-        edit.perform_command(&app.edit_state, .Copy)
-    }
-    if key_mod_pair_is_pressed(.Control, util.KEY_V) {
-        edit.perform_command(&app.edit_state, .Paste)
-    }
     text := strings.to_string(app.edit_builder)
+    // Draw caret
     if app.cursor_blink_state {
         selection_color := colorscheme_elem_color(.Caret)
         selection_color.a = 0.3
         rg_fill_rect(
-            Rect{
-                x=cast(i32)app.char_dims.x*cast(i32)app.edit_state.selection[0],
-                y=cast(i32)0,
-                w=cast(i32)app.char_dims.x,
-                h=cast(i32)app.char_dims.y
-            },
+            app.caret_rect,
             selection_color
         )
     }
     in_selection: bool
-    rg_begin_multithread()
-    for c, i in text {
-        if c == 0 {
-            break
+    hovered_char_index := -1
+    reached_carriage_return: bool
+    tbi: Textbox_Iterator
+    textbox_iterator_init(
+        &tbi,
+        text,
+        app.start_pos,
+        {app.update_info.framebuffer.w, app.update_info.framebuffer.h}
+    )
+
+    for tbc in textbox_iterator_next_char(&tbi) {
+        if tbc.printable {
+            rg_blit(
+                cast(vec2)tbc.draw_pos,
+                tbc.src_rect,
+            )
         }
-        bc := app.baked_chars[c-32]
-        advance_width, left_side_bearing: i32
-        stbtt.GetCodepointHMetrics(&app.font_info, c, &advance_width, &left_side_bearing)
-        y := (i32)(cast(f32)app.font_ascent + bc.yoff)
-        h := cast(i32)(bc.y1 - bc.y0)
-        sel_lo, sel_hi := edit.sorted_selection(&app.edit_state)
-        if !in_selection {
-            if i >= sel_lo && i <= sel_hi {
-                in_selection = true
-                if app.cursor_blink_state {
-                    rg_color(colorscheme_elem_color(.Selected_Text))
-                }
-            }
-        } else {
-            if i > sel_hi {
-                in_selection = false
-                rg_color(colorscheme_elem_color(.Plain_Text))
+        if tbc.index == app.edit_state.selection[0] {
+            app.caret_rect = Rect {
+                cast(i32)tbc.pos.x,
+                cast(i32)tbc.pos.y,
+                cast(i32)tbc.dims.x,
+                cast(i32)tbc.dims.y,
             }
         }
-        rg_blit(
-            cast(vec2)pen_pos+{(i32)(cast(f32)left_side_bearing*app.font_scale), y},
-            Rect{
-                x=cast(i32)bc.x0,
-                y=cast(i32)bc.y0,
-                w=cast(i32)(bc.x1 - bc.x0),
-                h=h,
-            },
-        )
-        pen_pos.x += bc.xadvance
     }
-    rg_end_multithread()
     app.cursor_blink_frame_counter -= 1
     if app.cursor_blink_frame_counter <= 0 {
         reset_cursor_blink_state()
     }
-    rg_to_output(update_info.framebuffer)
-    app.frame_index += 1
-    app.input_state.transient = {}
-    return app.running
+    rg_to_output(app.update_info.framebuffer)
 }
 
 reset_cursor_blink_state :: proc(set_state: Maybe(bool) = nil) {
@@ -236,60 +377,44 @@ app_handle_event :: proc(event: util.Window_Event) {
         }
         if event.key.pressed {
             switch event.key.keycode {
-            case util.KEY_ESCAPE:
-                // TODO: make no selection
-                lo, hi := edit.sorted_selection(&app.edit_state)
-                app.edit_state.selection = {lo, lo}
-            case util.KEY_PAGEUP:
-                app.font_path_index = util.wrap(app.font_path_index+1, len(FONT_PATHS))
-                change_font()
-            case util.KEY_PAGEDOWN:
-                app.colorscheme_index = util.wrap(app.colorscheme_index+1, len(COLORSCHEMES))
-            case util.KEY_NR_PLUS:
-                if modifier_is_held(.Control) {
-                    app.font_pixel_height += 1
-                    change_font()
-                }
-            case util.KEY_NR_MINUS:
-                if modifier_is_held(.Control) {
-                    app.font_pixel_height -= 1
-                    change_font()
-                }
-            case util.KEY_LEFT:
+            case util.KEY_TAB:
                 if modifier_is_held(.Shift) {
-                    edit.perform_command(&app.edit_state, .Select_Left)
+                    app.start_pos.x -= 10
                 } else {
-                    edit.perform_command(&app.edit_state, .Left)
+                    app.start_pos.x += 10
                 }
-            case util.KEY_RIGHT:
-                if modifier_is_held(.Shift) {
-                    edit.perform_command(&app.edit_state, .Select_Right)
-                } else {
-                    edit.perform_command(&app.edit_state, .Right)
-                }
-            case util.KEY_DELETE:
-                edit.perform_command(&app.edit_state, .Delete)
-            case util.KEY_BACKSPACE:
-                if modifier_is_held(.Control) {
-                    edit.perform_command(&app.edit_state, .Delete_Word_Left)
-                } else {
-                    edit.perform_command(&app.edit_state, .Backspace)
-                }
-            case util.KEY_HOME:
-                edit.perform_command(&app.edit_state, .Start)
-            case util.KEY_END:
-                edit.perform_command(&app.edit_state, .End)
+                app.start_pos.x = math.clamp(app.start_pos.x, 0, 100)
             }
+            modifier: Maybe(util.Modifier_Key)
+            if modifier_is_held(.Shift) {
+                modifier = .Shift
+            } else if modifier_is_held(.Control) {
+                modifier = .Control
+            } else if modifier_is_held(.Alt) {
+                modifier = .Alt
+            }
+            check_key_shortcut(event, modifier)
         }
         reset_cursor_blink_state(true)
     case .Char_Input:
         if !modifier_is_held(.Control) && !modifier_is_held(.Alt) {
-            c := event.char_codepoint - 32 
-            if c >= 0 && c < 96 {
-                edit.input_rune(&app.edit_state, cast(rune)event.char_codepoint)
+            codepoint := event.char_codepoint
+            valid_input_char := (codepoint >= 32 && codepoint < 127) || codepoint == '\n' || codepoint == '\r'
+            if valid_input_char {
+                if codepoint == '\r' {
+                    codepoint = '\n'
+                }
+                edit.input_rune(&app.edit_state, cast(rune)codepoint)
                 reset_cursor_blink_state(true)
             }
         }
+    case .Mouse_Button:
+        if event.mouse_button.button == .Right {
+            app.start_pos.y += 10
+        } else if event.mouse_button.button == .Middle {
+            app.start_pos.y -= 10
+        }
+        app.start_pos.x = math.clamp(app.start_pos.x, 0, 100)
     case .Window_Close:
         app.running = false
     }
@@ -318,12 +443,35 @@ change_font :: proc() {
         app.font_pixmap.h,
         32,
         96,
-        raw_data(app.baked_chars[:]),
+        raw_data(app.packed_chars[:]),
     )
+    when false {
+        app.font_pack_context = {}
+        assert(cast(bool)stbtt.PackBegin(
+            &app.font_pack_context,
+            cast([^]u8)app.font_pixmap.pixels,
+            app.font_pixmap.w,
+            app.font_pixmap.h,
+            app.font_pixmap.pitch,
+            1,
+            nil 
+        ))
+        stbtt.PackSetOversampling(&app.font_pack_context, 2, 2)
+        assert(cast(bool)stbtt.PackFontRange(
+            &app.font_pack_context,
+            raw_data(app.font_data),
+            0,
+            cast(f32)app.font_pixel_height,
+            32,
+            95,
+            raw_data(app.packed_chars[:]),
+        ))
+        stbtt.PackEnd(&app.font_pack_context)
+    }
     app.char_dims = {}
-    for bc in app.baked_chars {
-        diff_x := (f32)(bc.x1 - bc.x0)
-        diff_y := (f32)(bc.y1 - bc.y0)
+    for pc in app.packed_chars {
+        diff_x := (f32)(pc.x1 - pc.x0)
+        diff_y := (f32)(pc.y1 - pc.y0)
         if diff_x > app.char_dims.x {
             app.char_dims.x = diff_x
         }
@@ -335,6 +483,7 @@ change_font :: proc() {
     stbtt.GetFontVMetrics(&app.font_info, &app.font_ascent, &app.font_descent, &app.font_line_gap)
     app.font_ascent = (i32)(cast(f32)app.font_ascent*app.font_scale)
     app.font_descent = (i32)(cast(f32)app.font_descent*app.font_scale)
+    app.font_yadvance = (f32)(app.font_ascent - app.font_descent + app.font_line_gap)
 }
 
 key_mod_pair_is_pressed :: proc "contextless" (

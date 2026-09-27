@@ -34,6 +34,7 @@ memory_device_context: win.HDC
 framebuffer_pixmap: util.Pixmap
 min_window_size, max_window_size: Maybe(vec2)
 window_position: vec2
+update_info: App_Update
 
 MOVE_WINDOW_TO_RIGHTMOST_MONITOR :: false
 
@@ -66,7 +67,7 @@ main :: proc() {
     window_class.hInstance = program_instance
     window_class.hIcon = nil
     window_class.hCursor = nil
-    window_class.hbrBackground = cast(win.HBRUSH)win.GetStockObject(win.WHITE_BRUSH)
+    window_class.hbrBackground = cast(win.HBRUSH)win.GetStockObject(win.BLACK_BRUSH)
     window_class.lpszMenuName = wide_string_literal("TryMenu")
     window_class.lpszClassName = app_name
 
@@ -268,7 +269,6 @@ main :: proc() {
     app_ok := app_init(App_Init{
         // gl_set_proc_address=win.gl_set_proc_address,
         // set_gamepad_rumble_proc=set_gamepad_rumble_xinput,
-        platform_command_proc=handle_platform_command_win,
         // get_window_dpi = proc() -> i32 {
         //     return cast(i32)win.GetDpiForWindow(window_handle)
         // },
@@ -303,7 +303,7 @@ main :: proc() {
             &client_rect
         )
         gamepad_state, is_connected := get_gamepad_state_xinput()
-        app_update := App_Update{
+        update_info = App_Update{
                 window_dims={
                 client_rect.right-client_rect.left,
                 client_rect.bottom-client_rect.top,
@@ -312,7 +312,8 @@ main :: proc() {
             // is_gamepad_connected=is_connected,
             framebuffer=framebuffer_pixmap,
         }
-        if !app_update_render(app_update) do return
+        if !app_update(update_info) do return
+        app_render()
 		device_context := win.GetDC(window_handle)
 		win.BitBlt(
 			device_context,
@@ -405,7 +406,12 @@ window_proc :: proc "stdcall" (
     case win.WM_PAINT:
         paintstruct: win.PAINTSTRUCT
         device_context := win.BeginPaint(window_handle, &paintstruct)
+        if running {
+            app_update(update_info)
+            app_render()
+        }
         win.EndPaint(window_handle, &paintstruct)
+        log.debug("WM_PAINT")
     case win.WM_DROPFILES:
         path_u16: [win.MAX_PATH]u16
         drop_handle := cast(win.HDROP)wparam
@@ -564,6 +570,8 @@ window_proc :: proc "stdcall" (
                 0,
             }
         }
+    case win.WM_SIZING:
+        win.InvalidateRect(window_handle, nil, win.FALSE)
     case win.WM_SIZE:
         width := win.GET_X_LPARAM(lparam)
         height := win.GET_Y_LPARAM(lparam)
@@ -572,6 +580,15 @@ window_proc :: proc "stdcall" (
             vec2={width, height},
         }
         update_framebuffer_win32()
+        update_info = App_Update {
+            window_dims={width, height},
+            framebuffer=framebuffer_pixmap,
+        }
+        if running {
+            app_update(update_info)
+            app_render()
+        }
+        log.debug("WM_SIZE")
     case win.WM_GETMINMAXINFO:
     	// TODO: use win.AdjustWindowRect() to adjust target size
         min_max_info := transmute(^win.MINMAXINFO)lparam
@@ -615,7 +632,7 @@ window_proc :: proc "stdcall" (
 // }}}
 }
 
-handle_platform_command_win :: proc(command: util.Platform_Command) {
+do_platform_command :: proc(command: util.Platform_Command) {
     #partial switch command.type {
     case .Quit:
         win.DestroyWindow(window_handle)
